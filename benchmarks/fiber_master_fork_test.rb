@@ -9,51 +9,184 @@ require 'json'
 QUERY_TEXT = "STATUS".freeze
 RESPONSE_TEXT = "OK".freeze
 
-if ARGV.size != 3
-  STDERR.puts "Usage: ./fiber_test <num workers> <number of requests/batch> <output filename>"
-  exit 1
+if ARGV.size < 3
+  abort "Usage: ./fiber_test <num workers> <number of requests/batch> <output filename>"
 end
 
 NUM_WORKERS = ARGV[0].to_i
 NUM_REQUESTS = ARGV[1].to_i
 OUTFILE = ARGV[2]
 
-# Fiber reactor code taken from
-# https://www.codeotaku.com/journal/2018-11/fibers-are-the-right-solution/index
-class Reactor
-  def initialize
-    @readable = {}
-    @writable = {}
+USE_NIO4R = ARGV[3] == 'nio4r'
+require 'nio' if USE_NIO4R
+
+if USE_NIO4R
+  class Reactor
+    def initialize
+      @selector = NIO::Selector.new
+      p @selector.backend
+    end
+
+    def run
+      until @selector.empty?
+        @selector.select do |monitor|
+          monitor.value.resume
+        end
+      end
+    end
+
+    def register(io, mode)
+      monitor = @selector.register(io, mode)
+      monitor.remove_interest(mode)
+      monitor.value = Fiber.current
+      monitor
+    end
+
+    def unregister(monitor)
+      monitor.close
+    end
+
+    def wait_readable(monitor)
+      monitor.add_interest(:r)
+      @selector.wakeup
+      Fiber.yield
+    end
+
+    def wait_writable(monitor)
+      monitor.add_interest(:w)
+      @selector.wakeup
+      Fiber.yield
+    end
+  end
+else
+  # Fiber reactor code taken from
+  # https://www.codeotaku.com/journal/2018-11/fibers-are-the-right-solution/index
+  class Reactor
+    def initialize
+      @readable = {}
+      @writable = {}
+    end
+
+    def register(io, mode)
+      io
+    end
+
+    def unregister(io)
+      io.close
+    end
+
+    def run
+      until @readable.empty? and @writable.empty?
+        readable, writable = IO.select(@readable.keys, @writable.keys, [])
+
+        readable.each do |io|
+          @readable[io].resume
+        end
+
+        writable.each do |io|
+          @writable[io].resume
+        end
+      end
+    end
+
+    def wait_readable(io)
+      raise unless io
+      @readable[io] = Fiber.current
+      Fiber.yield
+      @readable.delete(io)
+    end
+
+    def wait_writable(io)
+      raise unless io
+      @writable[io] = Fiber.current
+      Fiber.yield
+      @writable.delete(io)
+    end
+  end
+end
+
+class Wrapper
+  attr_reader :io, :mode, :monitor
+  def initialize(io, reactor, mode)
+    @io = io
+    @reactor = reactor
+    @mode = mode
   end
 
-  def run
-    until @readable.empty? and @writable.empty?
-      readable, writable = IO.select(@readable.keys, @writable.keys, [])
+  def to_io
+    @io
+  end
 
-      readable.each do |io|
-        @readable[io].resume
-      end
+  def register
+    @monitor = @reactor.register(@io, @mode)
+  end
 
-      writable.each do |io|
-        @writable[io].resume
+  def unregister
+    @reactor.unregister(@monitor)
+  end
+
+  def using
+    register
+    begin
+      yield
+    ensure
+      unregister
+    end
+  end
+
+  def read_nonblock(length)
+    while true
+      result = @io.read_nonblock(length, exception: false)
+      case result
+      when :wait_readable
+        @reactor.wait_readable(@monitor)
+      when :wait_writable
+        @reactor.wait_writable(@monitor)
+      else
+        return result
       end
     end
   end
 
-  def wait_readable(io)
-    raise "Nil io passed to wait_readable!" if io.nil?
-    @readable[io] = Fiber.current
-    Fiber.yield
-    @readable.delete(io)
+  def write_nonblock(buffer)
+    while true
+      result = @io.write_nonblock(buffer, exception: false)
+      case result
+      when :wait_readable
+        @reactor.wait_readable(@monitor)
+      when :wait_writable
+        @reactor.wait_writable(@monitor)
+      else
+        return result
+      end
+    end
   end
 
-  def wait_writable(io)
-    raise "Nil io passed to wait_writable!" if io.nil?
-    @writable[io] = Fiber.current
+  def read(length)
+    buffer = self.read_nonblock(length)
+    return buffer if buffer.bytesize == length
 
-    Fiber.yield
+    while chunk = self.read_nonblock(length - result.bytesize)
+      buffer << chunk
+      break if buffer.bytesize == length
+    end
 
-    @writable.delete(io)
+    buffer
+  end
+
+  def write(buffer)
+    total = buffer.bytesize
+    remaining = buffer
+
+    while true
+      written = self.write_nonblock(remaining)
+
+      if written == remaining.bytesize
+        return total
+      else
+        remaining = remaining.byteslice(written, remaining.bytesize - written)
+      end
+    end
   end
 end
 
@@ -70,20 +203,19 @@ workers = []
 
 #puts "Setting up pipes..."
 working_t0 = Time.now
+reactor = Reactor.new
 
 NUM_WORKERS.times do |i|
   r, w = IO.pipe
-  worker_read.push r
-  master_write.push w
+  worker_read.push Wrapper.new(r, reactor, :r)
+  master_write.push Wrapper.new(w, reactor, :w)
   writable_idx_for[w] = i
 
   r, w = IO.pipe
-  worker_write.push w
-  master_read.push r
+  worker_write.push Wrapper.new(w, reactor, :w)
+  master_read.push Wrapper.new(r, reactor, :r)
   readable_idx_for[r] = i
 end
-
-reactor = Reactor.new
 
 master_style = :process
 master_pid = fork do
@@ -97,12 +229,12 @@ master_pid = fork do
 
       # Receive responses
       readable.each do |io|
-        idx = readable_idx_for[io]
+        idx = readable_idx_for[io.to_io]
 
         buf = io.read(RESPONSE_TEXT.size)
         if buf != RESPONSE_TEXT
           master_read.delete(io)
-          raise.puts "Wrong response from worker! Got #{buf.inspect} instead of #{RESPONSE_TEXT.inspect}!"
+          raise "Wrong response from worker! Got #{buf.inspect} instead of #{RESPONSE_TEXT.inspect}!"
         else
           pending_read_msgs[idx] -= 1
           if pending_read_msgs[idx] == 0
@@ -116,8 +248,8 @@ master_pid = fork do
 
       # Send new messages
       writable.each do |io|
-        idx = writable_idx_for[io]
-        io.print QUERY_TEXT
+        idx = writable_idx_for[io.to_io]
+        io.write QUERY_TEXT
         pending_write_msgs[idx] -= 1
         if pending_write_msgs[idx] == 0
           # This changes the indexing of master_write, so it
@@ -134,15 +266,19 @@ master_pid = fork do
       NUM_WORKERS.times do |worker_num|
         # This fiber will handle a single batch
         f = Fiber.new do
-          NUM_REQUESTS.times do |req_num|
-            reactor.wait_writable(master_write[worker_num])
-            master_write[worker_num].print QUERY_TEXT
+          master_write[worker_num].using do
+            master_read[worker_num].using do
+              NUM_REQUESTS.times do |req_num|
+                # reactor.wait_writable(master_write[worker_num])
+                master_write[worker_num].write QUERY_TEXT
 
-            reactor.wait_readable(master_read[worker_num])
-            buf = master_read[worker_num].read(RESPONSE_TEXT.size)
+                # reactor.wait_readable(master_read[worker_num])
+                buf = master_read[worker_num].read(RESPONSE_TEXT.size)
 
-            if buf != RESPONSE_TEXT
-              raise "Error! Fiber no. #{worker_num} on req #{req_num} expected #{RESPONSE_TEXT.inspect} but got #{buf.inspect}!"
+                if buf != RESPONSE_TEXT
+                  raise "Error! Fiber no. #{worker_num} on req #{req_num} expected #{RESPONSE_TEXT.inspect} but got #{buf.inspect}!"
+                end
+              end
             end
           end
         end
@@ -158,16 +294,20 @@ end
 #puts "Setting up fibers..."
 NUM_WORKERS.times do |i|
   f = Fiber.new do
-    # Worker code
-    NUM_REQUESTS.times do |req_num|
-      reactor.wait_readable(worker_read[i])
-      q = worker_read[i].read(QUERY_TEXT.size)
-      if q != QUERY_TEXT
-        raise "Fail! Expected #{QUERY_TEXT.inspect} but got #{q.inspect} on request #{req_num.inspect}!"
-      end
+    worker_read[i].using do
+      worker_write[i].using do
+        # Worker code
+        NUM_REQUESTS.times do |req_num|
+          # reactor.wait_readable(worker_read[i])
+          q = worker_read[i].read(QUERY_TEXT.size)
+          if q != QUERY_TEXT
+            raise "Fail! Expected #{QUERY_TEXT.inspect} but got #{q.inspect} on request #{req_num.inspect}!"
+          end
 
-      reactor.wait_writable(worker_write[i])
-      worker_write[i].print(RESPONSE_TEXT)
+          # reactor.wait_writable(worker_write[i])
+          worker_write[i].write(RESPONSE_TEXT)
+        end
+      end
     end
   end
   workers.push f
