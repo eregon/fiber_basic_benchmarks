@@ -67,9 +67,6 @@ worker_write = []
 master_read = []
 master_write = []
 
-writable_idx_for = {}
-readable_idx_for = {}
-
 workers = []
 
 #puts "Setting up pipes..."
@@ -79,12 +76,10 @@ NUM_WORKERS.times do |i|
   r, w = IO.pipe
   worker_read.push r
   master_write.push w
-  writable_idx_for[w] = i
 
   r, w = IO.pipe
   worker_write.push w
   master_read.push r
-  readable_idx_for[r] = i
 end
 
 reactor = Reactor.new
