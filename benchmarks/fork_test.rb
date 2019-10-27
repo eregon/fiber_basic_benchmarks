@@ -74,7 +74,7 @@ loop do
     buf = io.read(RESPONSE_TEXT.size)
     if buf != RESPONSE_TEXT
       master_read.delete(io)
-      raise.puts "Wrong response from worker! Got #{buf.inspect} instead of #{RESPONSE_TEXT.inspect}!"
+      raise "Wrong response from worker! Got #{buf.inspect} instead of #{RESPONSE_TEXT.inspect}!"
     else
       pending_read_msgs[idx] -= 1
       if pending_read_msgs[idx] == 0
